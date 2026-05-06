@@ -478,6 +478,19 @@ kbd{background:var(--s3);border:1px solid var(--b2);border-bottom-width:2px;padd
       <p data-i18n="upload_sub">Starts blank - you define everything about your analysis</p>
       <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" onchange="handleFile(this.files[0])">
     </div>
+    <div class="div-lbl" style="margin:18px 0 12px;"><span data-i18n="gs_or">Or load from Google Sheets</span></div>
+    <div class="field-row" style="grid-template-columns:1fr auto auto;align-items:end;gap:8px;">
+      <div class="field" style="margin-bottom:0">
+        <label data-i18n="gs_label">Google Sheets share URL</label>
+        <input type="text" id="gsUrl" placeholder="https://docs.google.com/spreadsheets/d/.../edit#gid=0" data-i18n-placeholder="gs_placeholder" onkeydown="if(event.key==='Enter'){event.preventDefault();loadFromGoogleSheets();}">
+      </div>
+      <button class="btn btn-primary" onclick="loadFromGoogleSheets()" id="gsLoadBtn" data-i18n="gs_load">Load</button>
+      <button class="btn btn-ghost" onclick="refreshFromGoogleSheets()" id="gsRefreshBtn" style="display:none" data-i18n="gs_refresh">&#10227; Refresh</button>
+    </div>
+    <div id="gsStatus" style="font-size:12px;color:var(--t4);margin-top:8px;font-family:var(--mono)"></div>
+    <div class="hint" style="margin-top:6px;color:var(--t4);font-size:11.5px;line-height:1.6;" data-i18n-html="gs_hint">
+      Sheet must be shared with <strong>Anyone with the link</strong> (Viewer). The full workbook (every tab) loads when possible; otherwise just the active tab from the URL's <code>gid</code>.
+    </div>
   </div>
 
   <div id="sheetSection" style="display:none">
@@ -808,6 +821,8 @@ const defaultConfig = {
   exportIncludeNoGroup: true,
   exportGroupMode: 'merged',
   recordNotes: {},
+  // Last loaded Google Sheets URL (lets the Refresh button re-fetch the same sheet)
+  gsLastUrl: '',
   // Detected groupable text columns (BRAND, TEAM, REFERRAL, etc.) - used for chip strips and breakdowns
   autoGroupings: [],
   // Per-page quick filter state: { 'BRAND': ['Capital303'], 'REFERRAL': ['refprm','prmpk11'] }
@@ -839,6 +854,11 @@ document.addEventListener('DOMContentLoaded', () => {
   setupKeyboard();
   renderColorPicker();
   renderExportOptions();
+  // If we have a remembered Google Sheets URL, prefill the input and reveal the Refresh button.
+  if(config.gsLastUrl) {
+    const inp = document.getElementById('gsUrl'); if(inp) inp.value = config.gsLastUrl;
+    const refreshBtn = document.getElementById('gsRefreshBtn'); if(refreshBtn) refreshBtn.style.display = '';
+  }
 });
 
 function applyTheme() {
@@ -1186,6 +1206,107 @@ function handleFile(file) {
   };
   reader.readAsArrayBuffer(file);
   document.getElementById('fileInfo').textContent = file.name + '  ·  ' + (file.size / 1024).toFixed(1) + ' KB';
+  // Clear any prior GSheets binding so the Refresh button doesn't reload stale data
+  config.gsLastUrl = ''; persist();
+  const refreshBtn = document.getElementById('gsRefreshBtn'); if(refreshBtn) refreshBtn.style.display = 'none';
+}
+
+// =========================================================================
+// GOOGLE SHEETS LOADER
+// Parses common Google Sheets share URLs and fetches them as either a full
+// workbook (.xlsx export) or a single CSV (when only the gid is shareable).
+// The sheet must be set to "Anyone with the link → Viewer" or be published.
+// =========================================================================
+function _gsParseUrl(url) {
+  if(!url) return null;
+  const trimmed = String(url).trim();
+  // Format A: published-to-web /d/e/{LONGID}/pub
+  let m = trimmed.match(/\/spreadsheets\/d\/e\/([a-zA-Z0-9_-]+)\//);
+  if(m) {
+    const longId = m[1];
+    const gidMatch = trimmed.match(/[?#&]gid=(\d+)/);
+    return { kind: 'pub', id: longId, gid: gidMatch ? gidMatch[1] : '0' };
+  }
+  // Format B: standard /spreadsheets/d/{ID}
+  m = trimmed.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/);
+  if(m) {
+    const id = m[1];
+    const gidMatch = trimmed.match(/[?#&]gid=(\d+)/);
+    return { kind: 'priv', id, gid: gidMatch ? gidMatch[1] : null };
+  }
+  // Direct CSV / xlsx export URL
+  if(/\.csv($|\?)/i.test(trimmed) || /format=csv/i.test(trimmed) || /format=xlsx/i.test(trimmed)) {
+    return { kind: 'direct', url: trimmed };
+  }
+  return null;
+}
+
+function _gsBuildExportUrls(parsed) {
+  if(parsed.kind === 'direct') return [parsed.url];
+  if(parsed.kind === 'pub') {
+    // Pub URLs only support per-gid CSV
+    return ['https://docs.google.com/spreadsheets/d/e/' + parsed.id + '/pub?output=csv' + (parsed.gid ? '&gid=' + parsed.gid : '')];
+  }
+  // Private-share with anyone-with-link: try the full xlsx export first (gets all sheets),
+  // then fall back to per-gid CSV if that fails (CORS, permissions, etc.)
+  const urls = ['https://docs.google.com/spreadsheets/d/' + parsed.id + '/export?format=xlsx'];
+  urls.push('https://docs.google.com/spreadsheets/d/' + parsed.id + '/export?format=csv' + (parsed.gid ? '&gid=' + parsed.gid : ''));
+  return urls;
+}
+
+async function loadFromGoogleSheets() {
+  const url = (document.getElementById('gsUrl') || {}).value || '';
+  const parsed = _gsParseUrl(url);
+  const status = document.getElementById('gsStatus');
+  const btn = document.getElementById('gsLoadBtn');
+  if(!parsed) {
+    if(status) status.innerHTML = '<span style="color:var(--red)">' + escapeHtml(_t('gs_invalid_url')) + '</span>';
+    return;
+  }
+  const urls = _gsBuildExportUrls(parsed);
+  if(btn) { btn.disabled = true; btn.textContent = _t('gs_loading'); }
+  if(status) status.innerHTML = '<span>' + escapeHtml(_t('gs_loading')) + ' ' + escapeHtml(urls[0]) + '</span>';
+
+  let lastErr = null;
+  for(let i = 0; i < urls.length; i++) {
+    const tryUrl = urls[i];
+    try {
+      const res = await fetch(tryUrl, { method: 'GET', mode: 'cors', credentials: 'omit', redirect: 'follow' });
+      if(!res.ok) throw new Error('HTTP ' + res.status + ' ' + res.statusText);
+      const isCsv = /format=csv|\.csv($|\?)|\/pub\?/i.test(tryUrl);
+      let parsedWb;
+      if(isCsv) {
+        const text = await res.text();
+        parsedWb = XLSX.read(text, { type: 'string', cellDates: true, raw: false });
+      } else {
+        const buf = await res.arrayBuffer();
+        parsedWb = XLSX.read(new Uint8Array(buf), { type: 'array', cellDates: true });
+      }
+      workbook = parsedWb;
+      processWorkbook();
+      // Remember the URL so Refresh works
+      config.gsLastUrl = url; persist();
+      const refreshBtn = document.getElementById('gsRefreshBtn'); if(refreshBtn) refreshBtn.style.display = '';
+      const fileInfo = document.getElementById('fileInfo'); if(fileInfo) fileInfo.textContent = 'Google Sheet  ·  ' + workbook.SheetNames.length + ' tab' + (workbook.SheetNames.length>1?'s':'');
+      if(status) status.innerHTML = '<span style="color:var(--green)">&#10003; ' + escapeHtml(_t('gs_loaded').replace('{n}', allData.length.toLocaleString()).replace('{t}', workbook.SheetNames.length)) + '</span>';
+      if(btn) { btn.disabled = false; btn.textContent = _t('gs_load'); }
+      return;
+    } catch(err) {
+      lastErr = err;
+      if(status) status.innerHTML = '<span style="color:var(--orange)">' + escapeHtml(_t('gs_retry')) + ' (' + (i+1) + '/' + urls.length + '): ' + escapeHtml(err.message) + '</span>';
+    }
+  }
+  if(btn) { btn.disabled = false; btn.textContent = _t('gs_load'); }
+  const msg = lastErr ? lastErr.message : 'unknown error';
+  if(status) status.innerHTML = '<span style="color:var(--red)">' + escapeHtml(_t('gs_failed')) + ' ' + escapeHtml(msg) + '</span>';
+  toast(_t('gs_failed') + ' ' + msg, 'error');
+}
+
+function refreshFromGoogleSheets() {
+  if(!config.gsLastUrl) return;
+  const inp = document.getElementById('gsUrl');
+  if(inp) inp.value = config.gsLastUrl;
+  loadFromGoogleSheets();
 }
 
 function processWorkbook() {
@@ -4372,6 +4493,17 @@ const I18N = {
     toast_suggest_no_data:'Upload data first to get suggestions',
     toast_suggest_none:'No new rules to suggest - all detected ones already exist',
     toast_suggest_added:'Added {n} suggested rule(s)',
+    gs_or:'Or load from Google Sheets',
+    gs_label:'Google Sheets share URL',
+    gs_placeholder:'https://docs.google.com/spreadsheets/d/.../edit#gid=0',
+    gs_load:'Load',
+    gs_refresh:'⟳ Refresh',
+    gs_loading:'Loading...',
+    gs_retry:'Retrying',
+    gs_loaded:'Loaded {n} rows from {t} tab(s)',
+    gs_failed:'Failed to load:',
+    gs_invalid_url:'Not a recognizable Google Sheets URL',
+    gs_hint:'Sheet must be shared with <strong>Anyone with the link</strong> (Viewer). The full workbook (every tab) loads when possible; otherwise just the active tab from the URL\'s <code>gid</code>.',
   },
   id: {
     nav_data:'Data', nav_mapping:'Pemetaan Kolom', nav_rules:'Aturan', nav_groups:'Kelompok',
@@ -4611,6 +4743,17 @@ const I18N = {
     toast_suggest_no_data:'Unggah data dulu untuk mendapat saran',
     toast_suggest_none:'Tidak ada aturan baru - semua sudah ada',
     toast_suggest_added:'Menambah {n} aturan',
+    gs_or:'Atau muat dari Google Sheets',
+    gs_label:'URL berbagi Google Sheets',
+    gs_placeholder:'https://docs.google.com/spreadsheets/d/.../edit#gid=0',
+    gs_load:'Muat',
+    gs_refresh:'⟳ Segarkan',
+    gs_loading:'Memuat...',
+    gs_retry:'Mencoba lagi',
+    gs_loaded:'Memuat {n} baris dari {t} tab',
+    gs_failed:'Gagal memuat:',
+    gs_invalid_url:'URL Google Sheets tidak dikenali',
+    gs_hint:'Sheet harus dibagikan dengan <strong>Siapa pun yang punya link</strong> (Pelihat). Seluruh workbook (semua tab) akan dimuat jika bisa; jika tidak, hanya tab aktif dari <code>gid</code> di URL.',
   }
 };
 let _lang = localStorage.getItem('da_lang') || 'en';
