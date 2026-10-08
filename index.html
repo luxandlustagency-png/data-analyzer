@@ -1327,6 +1327,14 @@ function processWorkbook() {
     sheetTabsEl.appendChild(tab);
 
     const sheet = workbook.Sheets[name];
+    // Plain-number cells formatted with separators (e.g. #,##0 shows "878,700") would be
+    // re-parsed from text; use the stored value instead. Currency/% formats keep their text.
+    Object.keys(sheet).forEach(addr => {
+      const cell = sheet[addr];
+      if(addr[0] !== '!' && cell && cell.t === 'n' && typeof cell.w === 'string' && /^-?[\d.,\s]+$/.test(cell.w.trim())) {
+        cell.w = String(cell.v);
+      }
+    });
     const json = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
     json.forEach((row, rowIdx) => {
       const cleanRow = { _sheet: name, _row: rowIdx };
@@ -1569,7 +1577,8 @@ function parseNum(v) {
   } else if(lastComma > -1) {
     const parts = s.split(',');
     const allThousandShape = parts.length > 1 && parts.slice(1).every(p => /^\d{3}$/.test(p));
-    if(hadCurrency || (parts.length > 2 && allThousandShape)) s = s.replace(/,/g,'');
+    // "878,700" is thousands; "1,5" and "0,125" stay decimals
+    if(hadCurrency || (allThousandShape && /^[1-9]\d{0,2}$/.test(parts[0]))) s = s.replace(/,/g,'');
     else s = s.replace(',','.');
   }
   s = s.replace(/[\s_]/g,'');
